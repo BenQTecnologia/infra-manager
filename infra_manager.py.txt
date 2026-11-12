@@ -1,0 +1,880 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Gerenciador de Infraestrutura de TI (multiempresa)
+===================================================
+
+Tecnologias: Python 3.9+, Tkinter/ttk (já vem com o Python) e SQLite (módulo
+`sqlite3` da biblioteca padrão). NÃO exige nenhuma instalação via pip.
+
+ONDE OS DADOS SÃO SALVOS
+------------------------
+Tudo fica em  ./data/infra.db  (pasta "data" criada ao lado deste arquivo).
+Tabelas:
+  - usuarios : login + HASH da senha (nunca a senha em si)
+  - empresas : nome de cada empresa
+  - ativos   : servidores/estações de cada empresa (FK -> empresas)
+
+COMO A SEGURANÇA DE SENHAS FUNCIONA
+-----------------------------------
+- A senha digitada NUNCA é gravada. Gravamos apenas um hash gerado com
+  scrypt (função de derivação de chaves "memory-hard", recomendada para
+  senhas, equivalente em robustez ao bcrypt) da biblioteca padrão `hashlib`.
+- Cada usuário recebe um "salt" aleatório de 16 bytes (os.urandom): duas
+  senhas iguais geram hashes diferentes e tabelas pré-calculadas (rainbow
+  tables) deixam de funcionar.
+- Formato salvo no banco:  scrypt$N$r$p$<salt_base64>$<hash_base64>
+  Os parâmetros ficam junto do hash, então podem ser aumentados no futuro
+  sem invalidar senhas antigas.
+- No login, recalculamos o hash com o salt guardado e comparamos em tempo
+  constante (hmac.compare_digest), evitando ataques de temporização.
+- Não existe nenhuma senha no código-fonte. O usuário/senha de testes
+  ("suporte") deve ser criado por você na tela de Primeiro Acesso.
+
+Observação: os demais dados (IPs, AnyDesk etc.) ficam em texto no SQLite.
+Se precisar proteger o arquivo inteiro em disco, use criptografia de disco
+(BitLocker) ou SQLCipher.
+
+Execução:  python infra_manager.py
+"""
+
+import base64
+import hashlib
+import hmac
+import ipaddress
+import os
+import re
+import sqlite3
+import tkinter as tk
+from pathlib import Path
+from tkinter import messagebox, simpledialog, ttk
+
+# --------------------------------------------------------------------------
+# Caminhos
+# --------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"          # pasta específica do sistema
+DB_PATH = DATA_DIR / "infra.db"       # arquivo do banco SQLite
+
+# --------------------------------------------------------------------------
+# Segurança: hash de senhas com scrypt
+# --------------------------------------------------------------------------
+SCRYPT_N = 2 ** 14   # custo de CPU/memória (16 MB por hash)
+SCRYPT_R = 8
+SCRYPT_P = 1
+SCRYPT_DKLEN = 32
+MIN_PASSWORD_LEN = 8
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def hash_password(password: str) -> str:
+    """Gera 'scrypt$N$r$p$salt$hash'. É isto (e só isto) que vai ao banco."""
+    salt = os.urandom(16)
+    digest = hashlib.scrypt(
+        password.encode("utf-8"), salt=salt,
+        n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, dklen=SCRYPT_DKLEN,
+    )
+    return f"scrypt${SCRYPT_N}${SCRYPT_R}${SCRYPT_P}${_b64(salt)}${_b64(digest)}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    """Recalcula o hash com o salt salvo e compara em tempo constante."""
+    try:
+        algo, n, r, p, salt_b64, hash_b64 = stored.split("$")
+        if algo != "scrypt":
+            return False
+        salt = base64.b64decode(salt_b64)
+        expected = base64.b64decode(hash_b64)
+        candidate = hashlib.scrypt(
+            password.encode("utf-8"), salt=salt,
+            n=int(n), r=int(r), p=int(p), dklen=len(expected),
+        )
+        return hmac.compare_digest(candidate, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+# Hash "falso" usado quando o usuário não existe, para que o tempo de resposta
+# seja o mesmo e não revele se o nome de usuário é válido.
+_DUMMY_HASH = hash_password("dummy-password-not-used")
+
+
+# --------------------------------------------------------------------------
+# Camada de banco de dados
+# --------------------------------------------------------------------------
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS usuarios (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash TEXT NOT NULL,              -- NUNCA texto limpo
+    criado_em     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS empresas (
+    id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome  TEXT NOT NULL UNIQUE COLLATE NOCASE
+);
+CREATE TABLE IF NOT EXISTS ativos (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    empresa_id  INTEGER NOT NULL REFERENCES empresas(id) ON DELETE CASCADE,
+    hostname    TEXT NOT NULL COLLATE NOCASE,
+    ip          TEXT DEFAULT '',
+    wireguard   TEXT DEFAULT '',
+    openvpn     TEXT DEFAULT '',
+    anydesk     TEXT DEFAULT '',
+    funcao      TEXT DEFAULT '',
+    estrutura   TEXT DEFAULT '',
+    modelo_so   TEXT DEFAULT '',
+    UNIQUE (empresa_id, hostname)
+);
+CREATE INDEX IF NOT EXISTS idx_ativos_empresa ON ativos(empresa_id);
+"""
+
+ASSET_FIELDS = ["hostname", "ip", "wireguard", "openvpn",
+                "anydesk", "funcao", "estrutura", "modelo_so"]
+
+
+class Database:
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.conn = None
+
+    # ---- inicialização ----------------------------------------------------
+    def _connect(self):
+        self.conn = sqlite3.connect(self.path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA foreign_keys = ON")   # habilita cascade
+
+    def is_ready(self) -> bool:
+        """True se a pasta/arquivo existem e já há ao menos um usuário."""
+        if not self.path.exists():      # checar ANTES: connect() cria o arquivo
+            return False
+        try:
+            if self.conn is None:
+                self._connect()
+            n = self.conn.execute("SELECT COUNT(*) FROM usuarios").fetchone()[0]
+            return n > 0
+        except sqlite3.Error:
+            return False
+
+    def initialize(self):
+        """Cria a pasta, o arquivo .db e as tabelas (primeiro acesso)."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.conn is None:
+            self._connect()
+        self.conn.executescript(SCHEMA)
+        self.conn.commit()
+
+    # ---- usuários -----------------------------------------------------------
+    def create_user(self, username: str, password: str):
+        self.conn.execute(
+            "INSERT INTO usuarios (username, password_hash) VALUES (?, ?)",
+            (username.strip(), hash_password(password)),
+        )
+        self.conn.commit()
+
+    def check_login(self, username: str, password: str) -> bool:
+        row = self.conn.execute(
+            "SELECT password_hash FROM usuarios WHERE username = ?",
+            (username.strip(),),
+        ).fetchone()
+        if row is None:
+            verify_password(password, _DUMMY_HASH)   # equaliza o tempo
+            return False
+        return verify_password(password, row["password_hash"])
+
+    # ---- empresas -----------------------------------------------------------
+    def list_companies(self):
+        return self.conn.execute(
+            "SELECT id, nome FROM empresas ORDER BY nome COLLATE NOCASE"
+        ).fetchall()
+
+    def get_company(self, company_id: int):
+        return self.conn.execute(
+            "SELECT id, nome FROM empresas WHERE id = ?", (company_id,)
+        ).fetchone()
+
+    def add_company(self, nome: str) -> int:
+        cur = self.conn.execute("INSERT INTO empresas (nome) VALUES (?)", (nome.strip(),))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def rename_company(self, company_id: int, nome: str):
+        self.conn.execute("UPDATE empresas SET nome = ? WHERE id = ?", (nome.strip(), company_id))
+        self.conn.commit()
+
+    def delete_company(self, company_id: int):
+        # ON DELETE CASCADE remove também todos os ativos da empresa
+        self.conn.execute("DELETE FROM empresas WHERE id = ?", (company_id,))
+        self.conn.commit()
+
+    # ---- ativos -------------------------------------------------------------
+    def list_assets(self, company_id: int):
+        return self.conn.execute(
+            "SELECT * FROM ativos WHERE empresa_id = ? ORDER BY hostname COLLATE NOCASE",
+            (company_id,),
+        ).fetchall()
+
+    def get_asset(self, asset_id: int):
+        return self.conn.execute("SELECT * FROM ativos WHERE id = ?", (asset_id,)).fetchone()
+
+    def add_asset(self, company_id: int, data: dict) -> int:
+        cols = ", ".join(ASSET_FIELDS)
+        marks = ", ".join("?" for _ in ASSET_FIELDS)
+        cur = self.conn.execute(
+            f"INSERT INTO ativos (empresa_id, {cols}) VALUES (?, {marks})",
+            (company_id, *[data[f].strip() for f in ASSET_FIELDS]),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def update_asset(self, asset_id: int, data: dict):
+        sets = ", ".join(f"{f} = ?" for f in ASSET_FIELDS)
+        self.conn.execute(
+            f"UPDATE ativos SET {sets} WHERE id = ?",
+            (*[data[f].strip() for f in ASSET_FIELDS], asset_id),
+        )
+        self.conn.commit()
+
+    def delete_asset(self, asset_id: int):
+        self.conn.execute("DELETE FROM ativos WHERE id = ?", (asset_id,))
+        self.conn.commit()
+
+    def search_assets(self, term: str, limit: int = 50):
+        """Busca global por hostname, IP, AnyDesk, função ou SO em todas as empresas."""
+        esc = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = f"%{esc}%"
+        return self.conn.execute(
+            """
+            SELECT a.*, e.nome AS empresa_nome
+              FROM ativos a JOIN empresas e ON e.id = a.empresa_id
+             WHERE a.hostname  LIKE ? ESCAPE '\\'
+                OR a.ip        LIKE ? ESCAPE '\\'
+                OR a.anydesk   LIKE ? ESCAPE '\\'
+                OR a.funcao    LIKE ? ESCAPE '\\'
+                OR a.modelo_so LIKE ? ESCAPE '\\'
+             ORDER BY e.nome COLLATE NOCASE, a.hostname COLLATE NOCASE
+             LIMIT ?
+            """,
+            (like, like, like, like, like, limit),
+        ).fetchall()
+
+
+# --------------------------------------------------------------------------
+# Interface
+# --------------------------------------------------------------------------
+COLORS = {
+    "bg": "#f3f4f6",
+    "side": "#1f2937",
+    "side_btn": "#374151",
+    "side_btn_hover": "#4b5563",
+    "side_sel": "#2563eb",
+    "side_fg": "#f9fafb",
+    "accent": "#16a34a",
+    "accent_hover": "#15803d",
+    "danger": "#dc2626",
+}
+
+TREE_COLUMNS = [
+    ("hostname", "HOSTNAME", 140),
+    ("ip", "IP", 120),
+    ("wireguard", "WIREGUARD", 90),
+    ("openvpn", "OPENVPN", 90),
+    ("anydesk", "ANYDESK", 110),
+    ("funcao", "FUNÇÃO", 190),
+    ("estrutura", "ESTRUTURA", 90),
+    ("modelo_so", "MODELO/SO", 190),
+]
+
+STATUS_OPTIONS = ["Sim", "Não", "Pendente"]
+STRUCTURE_OPTIONS = ["Físico", "Virtual", "Híbrido"]
+
+
+def validate_ips(text: str):
+    """Aceita um ou mais IPs separados por vírgula/;/espaço. Retorna IP inválido ou None."""
+    for token in re.split(r"[,\s;]+", text.strip()):
+        if not token:
+            continue
+        try:
+            ipaddress.ip_address(token)
+        except ValueError:
+            return token
+    return None
+
+
+class AssetDialog(tk.Toplevel):
+    """Janela modal para adicionar/editar um ativo. Resultado em self.result."""
+
+    def __init__(self, parent, title, initial=None):
+        super().__init__(parent)
+        self.title(title)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.result = None
+        initial = initial or {}
+
+        body = ttk.Frame(self, padding=18)
+        body.pack(fill="both", expand=True)
+
+        labels = {
+            "hostname": "Hostname *", "ip": "IP", "wireguard": "WireGuard",
+            "openvpn": "OpenVPN", "anydesk": "AnyDesk (ID)", "funcao": "Função",
+            "estrutura": "Estrutura", "modelo_so": "Modelo / SO",
+        }
+        self.vars = {}
+        for row, field in enumerate(ASSET_FIELDS):
+            ttk.Label(body, text=labels[field]).grid(row=row, column=0, sticky="w", pady=4, padx=(0, 12))
+            var = tk.StringVar(value=initial.get(field, "") or "")
+            self.vars[field] = var
+            if field in ("wireguard", "openvpn"):
+                # editável: permite "Sim", "Não" ou um status livre
+                w = ttk.Combobox(body, textvariable=var, values=STATUS_OPTIONS, width=34)
+            elif field == "estrutura":
+                w = ttk.Combobox(body, textvariable=var, values=STRUCTURE_OPTIONS,
+                                 width=34, state="readonly")
+            else:
+                w = ttk.Entry(body, textvariable=var, width=37)
+            w.grid(row=row, column=1, sticky="ew", pady=4)
+            if row == 0:
+                w.focus_set()
+
+        btns = ttk.Frame(body)
+        btns.grid(row=len(ASSET_FIELDS), column=0, columnspan=2, pady=(14, 0), sticky="e")
+        ttk.Button(btns, text="Cancelar", command=self.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(btns, text="Salvar", style="Accent.TButton", command=self._save).pack(side="right")
+
+        self.bind("<Return>", lambda e: self._save())
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.grab_set()
+
+    def _save(self):
+        data = {f: v.get().strip() for f, v in self.vars.items()}
+        if not data["hostname"]:
+            messagebox.showwarning("Campo obrigatório", "Informe o HOSTNAME.", parent=self)
+            return
+        bad = validate_ips(data["ip"])
+        if bad:
+            messagebox.showwarning("IP inválido", f"'{bad}' não é um endereço IP válido.", parent=self)
+            return
+        self.result = data
+        self.destroy()
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Gerenciador de Infraestrutura de TI")
+        self.geometry("1280x760")
+        self.minsize(1000, 600)
+        self.configure(bg=COLORS["bg"])
+        self._setup_styles()
+
+        self.db = Database(DB_PATH)
+        self.current_user = None
+        self.current_company = None
+        self.company_buttons = {}
+        self.search_results = []
+        self.failed_attempts = 0
+        self.container = None
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Fluxo de inicialização: banco existe? -> login; senão -> primeiro acesso
+        if self.db.is_ready():
+            self.show_login()
+        else:
+            self.show_setup()
+
+    # ---- estilo ---------------------------------------------------------------
+    def _setup_styles(self):
+        style = ttk.Style(self)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure(".", font=("Segoe UI", 10))
+        style.configure("TFrame", background=COLORS["bg"])
+        style.configure("Card.TFrame", background="white")
+        style.configure("TLabel", background=COLORS["bg"])
+        style.configure("Card.TLabel", background="white")
+        style.configure("Title.TLabel", background="white", font=("Segoe UI", 16, "bold"))
+        style.configure("Header.TLabel", font=("Segoe UI", 15, "bold"))
+        style.configure("Muted.TLabel", foreground="#6b7280")
+        style.configure("TButton", padding=(10, 5))
+        style.configure("Accent.TButton", background=COLORS["accent"], foreground="white")
+        style.map("Accent.TButton", background=[("active", COLORS["accent_hover"])])
+        style.configure("Danger.TButton", foreground=COLORS["danger"])
+        style.configure("Treeview", rowheight=28, font=("Segoe UI", 10))
+        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
+        style.map("Treeview", background=[("selected", COLORS["side_sel"])],
+                  foreground=[("selected", "white")])
+
+    def _reset_container(self):
+        if self.container is not None:
+            self.container.destroy()
+        self.container = ttk.Frame(self)
+        self.container.pack(fill="both", expand=True)
+        return self.container
+
+    def _on_close(self):
+        if self.db.conn is not None:
+            self.db.conn.close()
+        self.destroy()
+
+    # ---- tela: primeiro acesso -------------------------------------------------
+    def show_setup(self):
+        root = self._reset_container()
+        card = ttk.Frame(root, style="Card.TFrame", padding=30)
+        card.place(relx=0.5, rely=0.5, anchor="center")
+
+        ttk.Label(card, text="Primeiro Acesso", style="Title.TLabel").grid(
+            row=0, column=0, columnspan=2, pady=(0, 4))
+        ttk.Label(card, text="Crie o usuário master. O banco de dados será gerado em\n"
+                             f"{DB_PATH}", style="Card.TLabel", foreground="#6b7280",
+                  justify="center").grid(row=1, column=0, columnspan=2, pady=(0, 16))
+
+        user_var, pw_var, pw2_var = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        fields = [("Usuário", user_var, ""), ("Senha", pw_var, "•"), ("Confirmar senha", pw2_var, "•")]
+        entries = []
+        for i, (label, var, show) in enumerate(fields, start=2):
+            ttk.Label(card, text=label, style="Card.TLabel").grid(row=i, column=0, sticky="w", pady=6, padx=(0, 12))
+            e = ttk.Entry(card, textvariable=var, show=show, width=30)
+            e.grid(row=i, column=1, pady=6)
+            entries.append(e)
+        entries[0].focus_set()
+
+        def create():
+            username, pw, pw2 = user_var.get().strip(), pw_var.get(), pw2_var.get()
+            if not username:
+                messagebox.showwarning("Atenção", "Informe o nome de usuário.")
+                return
+            if len(pw) < MIN_PASSWORD_LEN:
+                messagebox.showwarning("Senha fraca", f"A senha deve ter ao menos {MIN_PASSWORD_LEN} caracteres.")
+                return
+            if pw != pw2:
+                messagebox.showwarning("Atenção", "A confirmação não confere com a senha.")
+                return
+            try:
+                self.db.initialize()           # cria pasta + .db + tabelas
+                self.db.create_user(username, pw)   # salva SOMENTE o hash
+            except (sqlite3.Error, OSError) as exc:
+                messagebox.showerror("Erro", f"Não foi possível criar o banco:\n{exc}")
+                return
+            messagebox.showinfo("Pronto", "Conta criada com sucesso. Faça login.")
+            self.show_login()
+
+        ttk.Button(card, text="Criar conta", style="Accent.TButton", command=create).grid(
+            row=5, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        for e in entries:
+            e.bind("<Return>", lambda ev: create())
+
+    # ---- tela: login ------------------------------------------------------------
+    def show_login(self):
+        root = self._reset_container()
+        card = ttk.Frame(root, style="Card.TFrame", padding=30)
+        card.place(relx=0.5, rely=0.5, anchor="center")
+
+        ttk.Label(card, text="Infraestrutura de TI", style="Title.TLabel").grid(
+            row=0, column=0, columnspan=2, pady=(0, 16))
+        user_var, pw_var = tk.StringVar(), tk.StringVar()
+        ttk.Label(card, text="Usuário", style="Card.TLabel").grid(row=1, column=0, sticky="w", pady=6, padx=(0, 12))
+        e_user = ttk.Entry(card, textvariable=user_var, width=30)
+        e_user.grid(row=1, column=1, pady=6)
+        ttk.Label(card, text="Senha", style="Card.TLabel").grid(row=2, column=0, sticky="w", pady=6, padx=(0, 12))
+        e_pw = ttk.Entry(card, textvariable=pw_var, show="•", width=30)
+        e_pw.grid(row=2, column=1, pady=6)
+        e_user.focus_set()
+
+        btn = ttk.Button(card, text="Entrar", style="Accent.TButton")
+        btn.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+
+        def attempt():
+            if str(btn["state"]) == "disabled":
+                return
+            username = user_var.get().strip()
+            if self.db.check_login(username, pw_var.get()):
+                self.failed_attempts = 0
+                self.current_user = username
+                self.show_main()
+                return
+            self.failed_attempts += 1
+            pw_var.set("")
+            messagebox.showerror("Acesso negado", "Usuário ou senha incorretos.")
+            if self.failed_attempts >= 3:     # freio simples contra força bruta
+                btn.state(["disabled"])
+                self.after(5000, lambda: btn.state(["!disabled"]))
+            e_pw.focus_set()
+
+        btn.configure(command=attempt)
+        e_user.bind("<Return>", lambda ev: e_pw.focus_set())
+        e_pw.bind("<Return>", lambda ev: attempt())
+
+    # ---- tela principal -----------------------------------------------------------
+    def show_main(self):
+        root = self._reset_container()
+        self.current_company = None
+        self.company_buttons = {}
+        root.rowconfigure(1, weight=1)
+        root.columnconfigure(1, weight=1)
+
+        # -- Barra superior com pesquisa direta
+        top = ttk.Frame(root, padding=(12, 8))
+        top.grid(row=0, column=0, columnspan=2, sticky="ew")
+        ttk.Label(top, text="🔍 Pesquisar:").pack(side="left")
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(top, textvariable=self.search_var, width=60)
+        self.search_entry.pack(side="left", padx=8)
+        ttk.Label(top, text="(hostname, IP, AnyDesk, função...)", style="Muted.TLabel").pack(side="left")
+        ttk.Button(top, text="Sair", command=self.logout).pack(side="right")
+        ttk.Label(top, text=f"Usuário: {self.current_user}", style="Muted.TLabel").pack(side="right", padx=12)
+
+        self.search_entry.bind("<KeyRelease>", self._on_search_key)
+        self.search_entry.bind("<Return>", self._on_search_enter)
+        self.search_entry.bind("<Escape>", lambda e: self._hide_search())
+
+        # -- Painel esquerdo (navegação)
+        side = tk.Frame(root, bg=COLORS["side"], width=270)
+        side.grid(row=1, column=0, sticky="ns")
+        side.grid_propagate(False)
+        side.rowconfigure(1, weight=1)
+        side.columnconfigure(0, weight=1)
+
+        tk.Button(side, text="+ Adicionar Nova Empresa", command=self.add_company,
+                  bg=COLORS["accent"], fg="white", activebackground=COLORS["accent_hover"],
+                  activeforeground="white", relief="flat", bd=0, cursor="hand2",
+                  font=("Segoe UI", 11, "bold"), pady=12).grid(
+            row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=10)
+
+        # Lista rolável de empresas (Canvas + Scrollbar + Frame interno)
+        self.side_canvas = tk.Canvas(side, bg=COLORS["side"], highlightthickness=0)
+        vsb = ttk.Scrollbar(side, orient="vertical", command=self.side_canvas.yview)
+        self.side_canvas.configure(yscrollcommand=vsb.set)
+        self.side_canvas.grid(row=1, column=0, sticky="nsew")
+        vsb.grid(row=1, column=1, sticky="ns")
+        self.company_inner = tk.Frame(self.side_canvas, bg=COLORS["side"])
+        win = self.side_canvas.create_window((0, 0), window=self.company_inner, anchor="nw")
+        self.company_inner.bind(
+            "<Configure>", lambda e: self.side_canvas.configure(scrollregion=self.side_canvas.bbox("all")))
+        self.side_canvas.bind("<Configure>", lambda e: self.side_canvas.itemconfigure(win, width=e.width))
+        self.side_canvas.bind("<Enter>", self._bind_wheel)
+        self.side_canvas.bind("<Leave>", self._unbind_wheel)
+        self.company_inner.bind("<Enter>", self._bind_wheel)
+
+        # -- Painel direito
+        self.right = ttk.Frame(root, padding=(16, 8, 16, 16))
+        self.right.grid(row=1, column=1, sticky="nsew")
+        self.right.rowconfigure(1, weight=1)
+        self.right.columnconfigure(0, weight=1)
+        self._build_right_panel()
+
+        # Lista de resultados da busca (aparece sob o campo de pesquisa)
+        self.search_list = tk.Listbox(root, height=8, font=("Segoe UI", 10), activestyle="dotbox",
+                                      relief="solid", bd=1)
+        self.search_list.bind("<ButtonRelease-1>", self._on_search_pick)
+        self.search_list.bind("<Return>", self._on_search_pick)
+        self.search_list.bind("<Escape>", lambda e: self._hide_search())
+
+        self.refresh_companies()
+        self._show_placeholder()
+
+    def logout(self):
+        self.current_user = None
+        self.show_login()
+
+    # ---- rolagem do mouse na lista de empresas -------------------------------------
+    def _bind_wheel(self, _e=None):
+        self.bind_all("<MouseWheel>", self._on_wheel)
+        self.bind_all("<Button-4>", self._on_wheel)   # Linux
+        self.bind_all("<Button-5>", self._on_wheel)
+
+    def _unbind_wheel(self, _e=None):
+        # só desliga se o ponteiro realmente saiu da área da lista
+        x, y = self.winfo_pointerxy()
+        w = self.winfo_containing(x, y)
+        while w is not None:
+            if w is self.side_canvas:
+                return
+            w = w.master
+        self.unbind_all("<MouseWheel>")
+        self.unbind_all("<Button-4>")
+        self.unbind_all("<Button-5>")
+
+    def _on_wheel(self, event):
+        if self.side_canvas.yview() == (0.0, 1.0):
+            return   # nada para rolar
+        if event.num == 4:
+            step = -1
+        elif event.num == 5:
+            step = 1
+        else:
+            step = -1 if event.delta > 0 else 1
+        self.side_canvas.yview_scroll(step, "units")
+
+    # ---- empresas ---------------------------------------------------------------------
+    def refresh_companies(self):
+        for w in self.company_inner.winfo_children():
+            w.destroy()
+        self.company_buttons.clear()
+        companies = self.db.list_companies()
+        if not companies:
+            tk.Label(self.company_inner, text="Nenhuma empresa cadastrada.", bg=COLORS["side"],
+                     fg="#9ca3af", pady=20).pack(fill="x")
+        for c in companies:
+            b = tk.Button(self.company_inner, text=c["nome"], anchor="w", padx=14, pady=9,
+                          relief="flat", bd=0, cursor="hand2", font=("Segoe UI", 10),
+                          bg=COLORS["side_btn"], fg=COLORS["side_fg"],
+                          activebackground=COLORS["side_btn_hover"], activeforeground="white",
+                          command=lambda cid=c["id"]: self.select_company(cid))
+            b.pack(fill="x", padx=8, pady=2)
+            self.company_buttons[c["id"]] = b
+        self._highlight_company()
+
+    def _highlight_company(self):
+        for cid, b in self.company_buttons.items():
+            b.configure(bg=COLORS["side_sel"] if cid == self.current_company else COLORS["side_btn"])
+
+    def add_company(self):
+        nome = simpledialog.askstring("Nova empresa", "Nome da empresa:", parent=self)
+        if nome is None:
+            return
+        nome = nome.strip()
+        if not nome:
+            messagebox.showwarning("Atenção", "O nome não pode ser vazio.")
+            return
+        try:
+            cid = self.db.add_company(nome)
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Duplicada", f"Já existe uma empresa chamada '{nome}'.")
+            return
+        self.refresh_companies()
+        self.select_company(cid)
+
+    def rename_company(self):
+        if self.current_company is None:
+            return
+        atual = self.db.get_company(self.current_company)["nome"]
+        nome = simpledialog.askstring("Renomear empresa", "Novo nome:", initialvalue=atual, parent=self)
+        if not nome or not nome.strip():
+            return
+        try:
+            self.db.rename_company(self.current_company, nome)
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Duplicada", f"Já existe uma empresa chamada '{nome.strip()}'.")
+            return
+        self.refresh_companies()
+        self.select_company(self.current_company)
+
+    def delete_company(self):
+        if self.current_company is None:
+            return
+        comp = self.db.get_company(self.current_company)
+        total = len(self.db.list_assets(self.current_company))
+        if not messagebox.askyesno(
+                "Remover empresa",
+                f"Remover a empresa '{comp['nome']}' e seus {total} ativo(s)?\n\nEsta ação não pode ser desfeita.",
+                icon="warning"):
+            return
+        self.db.delete_company(self.current_company)
+        self.current_company = None
+        self.refresh_companies()
+        self._show_placeholder()
+
+    # ---- painel direito -----------------------------------------------------------------
+    def _build_right_panel(self):
+        # Cabeçalho: nome da empresa + ações
+        self.header = ttk.Frame(self.right)
+        self.header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        self.company_title = ttk.Label(self.header, text="", style="Header.TLabel")
+        self.company_title.pack(side="left")
+        ttk.Button(self.header, text="Remover Empresa", style="Danger.TButton",
+                   command=self.delete_company).pack(side="right")
+        ttk.Button(self.header, text="Renomear", command=self.rename_company).pack(side="right", padx=6)
+
+        # Tabela de ativos
+        self.table_frame = ttk.Frame(self.right)
+        self.table_frame.grid(row=1, column=0, sticky="nsew")
+        self.table_frame.rowconfigure(0, weight=1)
+        self.table_frame.columnconfigure(0, weight=1)
+        cols = [c[0] for c in TREE_COLUMNS]
+        self.tree = ttk.Treeview(self.table_frame, columns=cols, show="headings", selectmode="browse")
+        for key, title, width in TREE_COLUMNS:
+            self.tree.heading(key, text=title, command=lambda k=key: self._sort_tree(k, False))
+            self.tree.column(key, width=width, minwidth=60, anchor="w")
+        vsb = ttk.Scrollbar(self.table_frame, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(self.table_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        self.tree.tag_configure("odd", background="#f9fafb")
+        self.tree.tag_configure("even", background="white")
+        self.tree.bind("<Double-1>", lambda e: self.edit_asset())
+        self.tree.bind("<Delete>", lambda e: self.delete_asset())
+
+        # Botões CRUD
+        self.actions = ttk.Frame(self.right)
+        self.actions.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        ttk.Button(self.actions, text="+ Adicionar Novo Ativo/Servidor", style="Accent.TButton",
+                   command=self.add_asset).pack(side="left")
+        ttk.Button(self.actions, text="Editar", command=self.edit_asset).pack(side="left", padx=8)
+        ttk.Button(self.actions, text="Remover", style="Danger.TButton",
+                   command=self.delete_asset).pack(side="left")
+        self.count_label = ttk.Label(self.actions, text="", style="Muted.TLabel")
+        self.count_label.pack(side="right")
+
+        self.placeholder = ttk.Label(
+            self.right, text="Selecione uma empresa no painel à esquerda\nou use a barra de pesquisa.",
+            style="Muted.TLabel", justify="center", font=("Segoe UI", 12))
+
+    def _show_placeholder(self):
+        for w in (self.header, self.table_frame, self.actions):
+            w.grid_remove()
+        self.placeholder.grid(row=0, column=0, rowspan=3)
+
+    def _show_company_panel(self):
+        self.placeholder.grid_remove()
+        self.header.grid()
+        self.table_frame.grid()
+        self.actions.grid()
+
+    def select_company(self, company_id: int):
+        comp = self.db.get_company(company_id)
+        if comp is None:
+            return
+        self.current_company = company_id
+        self._highlight_company()
+        self.company_title.configure(text=comp["nome"])
+        self._show_company_panel()
+        self.refresh_assets()
+
+    def refresh_assets(self, select_id=None):
+        self.tree.delete(*self.tree.get_children())
+        if self.current_company is None:
+            return
+        assets = self.db.list_assets(self.current_company)
+        for i, a in enumerate(assets):
+            values = [a[k] or "" for k, _, _ in TREE_COLUMNS]
+            self.tree.insert("", "end", iid=str(a["id"]), values=values,
+                             tags=("odd" if i % 2 else "even",))
+        self.count_label.configure(text=f"{len(assets)} ativo(s)")
+        if select_id is not None and self.tree.exists(str(select_id)):
+            self.tree.selection_set(str(select_id))
+            self.tree.focus(str(select_id))
+            self.tree.see(str(select_id))
+
+    def _sort_tree(self, col, reverse):
+        items = [(self.tree.set(i, col).lower(), i) for i in self.tree.get_children("")]
+        items.sort(reverse=reverse)
+        for idx, (_, iid) in enumerate(items):
+            self.tree.move(iid, "", idx)
+            self.tree.item(iid, tags=("odd" if idx % 2 else "even",))
+        self.tree.heading(col, command=lambda: self._sort_tree(col, not reverse))
+
+    def _selected_asset_id(self):
+        sel = self.tree.selection()
+        return int(sel[0]) if sel else None
+
+    # ---- CRUD de ativos -------------------------------------------------------------------
+    def add_asset(self):
+        if self.current_company is None:
+            return
+        dlg = AssetDialog(self, "Novo Ativo/Servidor")
+        self.wait_window(dlg)
+        if dlg.result is None:
+            return
+        try:
+            new_id = self.db.add_asset(self.current_company, dlg.result)
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Duplicado", f"Já existe um ativo '{dlg.result['hostname']}' nesta empresa.")
+            return
+        self.refresh_assets(select_id=new_id)
+
+    def edit_asset(self):
+        asset_id = self._selected_asset_id()
+        if asset_id is None:
+            messagebox.showinfo("Editar", "Selecione uma linha para editar.")
+            return
+        row = self.db.get_asset(asset_id)
+        dlg = AssetDialog(self, f"Editar {row['hostname']}", initial=dict(row))
+        self.wait_window(dlg)
+        if dlg.result is None:
+            return
+        try:
+            self.db.update_asset(asset_id, dlg.result)
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Duplicado", f"Já existe um ativo '{dlg.result['hostname']}' nesta empresa.")
+            return
+        self.refresh_assets(select_id=asset_id)
+
+    def delete_asset(self):
+        asset_id = self._selected_asset_id()
+        if asset_id is None:
+            messagebox.showinfo("Remover", "Selecione uma linha para remover.")
+            return
+        row = self.db.get_asset(asset_id)
+        if messagebox.askyesno("Remover ativo", f"Remover '{row['hostname']}'?", icon="warning"):
+            self.db.delete_asset(asset_id)
+            self.refresh_assets()
+
+    # ---- pesquisa direta --------------------------------------------------------------------
+    def _on_search_key(self, event):
+        if event.keysym in ("Return", "Escape", "Up", "Down", "Tab"):
+            if event.keysym == "Down" and self.search_list.winfo_ismapped():
+                self.search_list.focus_set()
+                self.search_list.selection_set(0)
+            return
+        term = self.search_var.get().strip()
+        if len(term) < 2:
+            self._hide_search()
+            return
+        self.search_results = self.db.search_assets(term)
+        self.search_list.delete(0, "end")
+        if not self.search_results:
+            self.search_list.insert("end", "Nenhum resultado")
+        for r in self.search_results:
+            self.search_list.insert(
+                "end", f"{r['hostname']}   |   {r['ip'] or '-'}   |   {r['empresa_nome']}")
+        self.search_list.place(in_=self.search_entry, relx=0, rely=1.0, relwidth=1.0, y=2)
+        self.search_list.lift()
+
+    def _on_search_enter(self, _event=None):
+        term = self.search_var.get().strip()
+        if len(term) < 1:
+            return
+        results = self.db.search_assets(term)
+        if not results:
+            messagebox.showinfo("Pesquisa", "Nenhum ativo encontrado.")
+            return
+        # Se há correspondência exata de hostname/IP, vai direto nela; senão, na primeira.
+        exact = [r for r in results
+                 if r["hostname"].lower() == term.lower() or term in re.split(r"[,\s;]+", r["ip"] or "")]
+        self._goto_asset((exact or results)[0])
+
+    def _on_search_pick(self, _event=None):
+        sel = self.search_list.curselection()
+        if sel and self.search_results and sel[0] < len(self.search_results):
+            self._goto_asset(self.search_results[sel[0]])
+
+    def _goto_asset(self, row):
+        self._hide_search()
+        self.search_var.set("")
+        self.select_company(row["empresa_id"])
+        self.refresh_assets(select_id=row["id"])
+        self.tree.focus_set()
+
+    def _hide_search(self):
+        self.search_list.place_forget()
+        self.search_results = []
+
+
+def main():
+    app = App()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

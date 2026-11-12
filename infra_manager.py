@@ -45,6 +45,7 @@ import ipaddress
 import os
 import re
 import sqlite3
+import sys
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
@@ -52,7 +53,10 @@ from tkinter import messagebox, simpledialog, ttk
 # --------------------------------------------------------------------------
 # Caminhos
 # --------------------------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"          # pasta específica do sistema
 DB_PATH = DATA_DIR / "infra.db"       # arquivo do banco SQLite
 

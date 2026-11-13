@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Gerenciador de Infraestrutura de TI (multiempresa)  -  v2 corporativa
-=====================================================================
+Gerenciador de Infraestrutura de TI (multiempresa)  -  v3 (com Base de Conhecimento)
+=============================================================================
 
 Tecnologias: Python 3.9+, Tkinter/ttk e SQLite. Somente biblioteca padrão:
 NÃO exige nenhuma instalação via pip.
@@ -16,6 +16,9 @@ Tabelas:
   - empresas    : nome de cada empresa
   - ativos      : servidores/estações (FK -> empresas, remoção em cascata)
   - credenciais : e-mails, logins e senhas por empresa (FK -> empresas)
+  - manual_blocos : categorias da Base de Conhecimento (Redes e VPNs, Impressoras...)
+  - manuais       : manuais de cada bloco (caminho do arquivo/link e/ou conteúdo)
+  - meta          : marcadores internos (ex.: blocos iniciais já criados)
 Erros inesperados são gravados em ./data/erro.log.
 
 SEGURANÇA
@@ -51,6 +54,13 @@ SEGURANÇA
    - Senhas copiadas são removidas da área de transferência após 30 s
      (se ainda forem o conteúdo atual) e ao sair da conta.
 
+4) Manuais de Apoio (Base de Conhecimento)
+   - Cada manual guarda o CAMINHO de um arquivo na rede, um link http(s) e/ou um
+     texto com o passo a passo. Não coloque senhas nos manuais: eles ficam em
+     texto legível no SQLite (use a aba E-mails e Credenciais, que é criptografada).
+   - Por segurança, o botão Abrir recusa executáveis/scripts (.exe, .bat, .ps1,
+     .lnk...) e links que não sejam http/https, mesmo que alguém altere o banco.
+
 Execução:  python infra_manager.py
 """
 
@@ -63,10 +73,12 @@ import re
 import secrets
 import sqlite3
 import string
+import subprocess
 import sys
 import tkinter as tk
+import webbrowser
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 # --------------------------------------------------------------------------
 # Caminhos
@@ -247,6 +259,25 @@ CREATE TABLE IF NOT EXISTS credenciais (
     obs         TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_cred_empresa ON credenciais(empresa_id);
+CREATE TABLE IF NOT EXISTS meta (
+    chave  TEXT PRIMARY KEY,
+    valor  TEXT
+);
+CREATE TABLE IF NOT EXISTS manual_blocos (
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome   TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    ordem  INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS manuais (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    bloco_id       INTEGER NOT NULL REFERENCES manual_blocos(id) ON DELETE CASCADE,
+    titulo         TEXT NOT NULL COLLATE NOCASE,
+    caminho        TEXT DEFAULT '',          -- arquivo na rede ou link http(s)
+    conteudo       TEXT DEFAULT '',          -- descrição / passo a passo
+    atualizado_em  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (bloco_id, titulo)
+);
+CREATE INDEX IF NOT EXISTS idx_manuais_bloco ON manuais(bloco_id);
 """
 
 ASSET_FIELDS = ["hostname", "ip", "wireguard", "openvpn",
@@ -259,6 +290,10 @@ _HISTORY_SOURCES = {
     ("ativos", "wireguard"), ("ativos", "openvpn"),
     ("credenciais", "servico"),
 }
+
+# Blocos criados na primeira vez (uma única vez: apagar todos não os recria).
+DEFAULT_MANUAL_BLOCKS = ["Redes e VPNs", "Servidores & Active Directory",
+                         "Impressoras", "Softwares & Pacote Office"]
 
 
 def _like(term: str) -> str:
@@ -284,6 +319,12 @@ class Database:
         cols = [r["name"] for r in self.conn.execute("PRAGMA table_info(usuarios)")]
         if "wrapped_key" not in cols:
             self.conn.execute("ALTER TABLE usuarios ADD COLUMN wrapped_key TEXT")
+        # Blocos iniciais da Base de Conhecimento (só na primeira migração).
+        if self.conn.execute("SELECT 1 FROM meta WHERE chave = 'manuais_seed'").fetchone() is None:
+            for pos, nome in enumerate(DEFAULT_MANUAL_BLOCKS, start=1):
+                self.conn.execute("INSERT OR IGNORE INTO manual_blocos (nome, ordem) VALUES (?, ?)",
+                                  (nome, pos))
+            self.conn.execute("INSERT INTO meta (chave, valor) VALUES ('manuais_seed', '1')")
         self.conn.commit()
 
     def is_ready(self) -> bool:
@@ -517,6 +558,97 @@ class Database:
                 ORDER BY aqui DESC, total DESC, d""", (company_id,)).fetchall()
         return [r["d"] for r in rows]
 
+    # ---- Base de Conhecimento: blocos e manuais -----------------------------------
+    _MANUAL_SELECT = """SELECT m.id, m.bloco_id, m.titulo, m.caminho, m.conteudo,
+               datetime(m.atualizado_em, 'localtime') AS atualizado_em, b.nome AS bloco_nome
+          FROM manuais m JOIN manual_blocos b ON b.id = m.bloco_id"""
+
+    def list_blocks(self):
+        return self.conn.execute(
+            "SELECT id, nome, ordem FROM manual_blocos ORDER BY ordem, nome COLLATE NOCASE"
+        ).fetchall()
+
+    def list_blocks_with_counts(self):
+        return self.conn.execute(
+            """SELECT b.id, b.nome,
+                      (SELECT COUNT(*) FROM manuais m WHERE m.bloco_id = b.id) AS manuais
+                 FROM manual_blocos b ORDER BY b.ordem, b.nome COLLATE NOCASE""").fetchall()
+
+    def get_block(self, block_id: int):
+        return self.conn.execute(
+            "SELECT id, nome, ordem FROM manual_blocos WHERE id = ?", (block_id,)).fetchone()
+
+    def add_block(self, nome: str) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO manual_blocos (nome, ordem) "
+            "VALUES (?, (SELECT COALESCE(MAX(ordem), 0) + 1 FROM manual_blocos))", (nome.strip(),))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def rename_block(self, block_id: int, nome: str):
+        self.conn.execute("UPDATE manual_blocos SET nome = ? WHERE id = ?", (nome.strip(), block_id))
+        self.conn.commit()
+
+    def delete_block(self, block_id: int):
+        # ON DELETE CASCADE remove também todos os manuais do bloco
+        self.conn.execute("DELETE FROM manual_blocos WHERE id = ?", (block_id,))
+        self.conn.commit()
+
+    def move_block(self, block_id: int, delta: int):
+        """Sobe (-1) ou desce (+1) um bloco na ordem de exibição."""
+        ids = [r["id"] for r in self.list_blocks()]
+        if block_id not in ids:
+            return
+        i = ids.index(block_id)
+        j = i + delta
+        if 0 <= j < len(ids):
+            ids[i], ids[j] = ids[j], ids[i]
+        with self.conn:
+            for pos, bid in enumerate(ids, start=1):
+                self.conn.execute("UPDATE manual_blocos SET ordem = ? WHERE id = ?", (pos, bid))
+
+    def list_manuals(self):
+        return self.conn.execute(
+            self._MANUAL_SELECT + " ORDER BY b.ordem, b.nome COLLATE NOCASE, "
+                                  "m.titulo COLLATE NOCASE").fetchall()
+
+    def get_manual(self, manual_id: int):
+        return self.conn.execute(self._MANUAL_SELECT + " WHERE m.id = ?", (manual_id,)).fetchone()
+
+    def add_manual(self, block_id: int, titulo: str, caminho: str, conteudo: str) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO manuais (bloco_id, titulo, caminho, conteudo) VALUES (?, ?, ?, ?)",
+            (block_id, titulo.strip(), caminho.strip(), conteudo.strip()))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def update_manual(self, manual_id: int, block_id: int, titulo: str, caminho: str, conteudo: str):
+        self.conn.execute(
+            "UPDATE manuais SET bloco_id = ?, titulo = ?, caminho = ?, conteudo = ?, "
+            "atualizado_em = CURRENT_TIMESTAMP WHERE id = ?",
+            (block_id, titulo.strip(), caminho.strip(), conteudo.strip(), manual_id))
+        self.conn.commit()
+
+    def delete_manual(self, manual_id: int):
+        self.conn.execute("DELETE FROM manuais WHERE id = ?", (manual_id,))
+        self.conn.commit()
+
+    def search_manuals(self, term: str, limit: int = 50):
+        """Busca em título, conteúdo, caminho e nome do bloco (título primeiro)."""
+        like = _like(term)
+        return self.conn.execute(
+            self._MANUAL_SELECT + """
+             WHERE m.titulo   LIKE ? ESCAPE '\\' OR m.conteudo LIKE ? ESCAPE '\\'
+                OR m.caminho  LIKE ? ESCAPE '\\' OR b.nome     LIKE ? ESCAPE '\\'
+             ORDER BY (m.titulo LIKE ? ESCAPE '\\') DESC, b.ordem,
+                      b.nome COLLATE NOCASE, m.titulo COLLATE NOCASE
+             LIMIT ?""", (like, like, like, like, like, limit)).fetchall()
+
+    def search_blocks(self, term: str, limit: int = 20):
+        return self.conn.execute(
+            "SELECT id, nome FROM manual_blocos WHERE nome LIKE ? ESCAPE '\\' "
+            "ORDER BY ordem, nome COLLATE NOCASE LIMIT ?", (_like(term), limit)).fetchall()
+
 
 # --------------------------------------------------------------------------
 # Funções puras de apoio (autocompletar, validação, exibição)
@@ -594,6 +726,59 @@ def status_display(text: str) -> str:
     return value
 
 
+# Arquivos que o botão "Abrir" NUNCA executa (o banco pode ser editado por terceiros).
+_BLOCKED_EXTENSIONS = {
+    ".exe", ".bat", ".cmd", ".com", ".msi", ".msp", ".scr", ".ps1", ".psm1", ".vbs", ".vbe",
+    ".js", ".jse", ".wsf", ".wsh", ".hta", ".lnk", ".reg", ".jar", ".cpl", ".dll", ".sh",
+    ".py", ".pyw",
+}
+
+
+def open_path(target: str):
+    """Abre arquivo/pasta/link com o programa padrão. Retorna mensagem de erro ou None."""
+    target = (target or "").strip().strip('"').strip()
+    if not target:
+        return "Este manual não tem caminho ou link."
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", target):
+        if not re.match(r"^https?://", target, re.I):
+            return "Por segurança, só links http:// e https:// podem ser abertos."
+        return None if webbrowser.open(target) else "Não foi possível abrir o navegador."
+    path = os.path.expandvars(os.path.expanduser(target))
+    ext = os.path.splitext(path)[1].lower()
+    if ext in _BLOCKED_EXTENSIONS:
+        return (f"Por segurança, o programa não abre executáveis/scripts ({ext}).\n"
+                "Use «Copiar caminho» e abra pelo Explorador de Arquivos.")
+    if not os.path.exists(path):
+        return (f"Caminho não encontrado:\n{path}\n\n"
+                "Confira o caminho e se a rede/VPN está conectada.")
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)                       # noqa: S606 (extensão já filtrada acima)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except OSError as exc:
+        return f"Não foi possível abrir:\n{exc}"
+    return None
+
+
+def manual_kind(manual) -> str:
+    """'Link', 'Arquivo' ou 'Procedimento' (só texto)."""
+    path = (manual["caminho"] or "").strip()
+    if re.match(r"^https?://", path, re.I):
+        return "Link"
+    return "Arquivo" if path else "Procedimento"
+
+
+def short_path(text: str, limit: int = 60) -> str:
+    """Encurta caminhos longos no meio: \\\\servidor\\pasta\u2026\\arquivo.pdf"""
+    if len(text) <= limit:
+        return text
+    head = limit // 3
+    return text[:head] + "…" + text[-(limit - head - 1):]
+
+
 # --------------------------------------------------------------------------
 # Visual
 # --------------------------------------------------------------------------
@@ -611,6 +796,7 @@ COLORS = {
     "row_alt": "#F8FAFC",
     "side": "#0F172A",        # menu lateral
     "side_hover": "#1E293B",
+    "side_hover2": "#334155",
     "side_sel": "#2563EB",
     "side_fg": "#F8FAFC",
     "side_muted": "#94A3B8",
@@ -630,6 +816,8 @@ FIELD_LABELS = {
     "anydesk": "AnyDesk", "funcao": "Função", "estrutura": "Estrutura",
     "modelo_so": "Modelo/SO", "servico": "Serviço", "email": "E-mail",
     "login": "Login", "senha": "Senha", "obs": "Observações",
+    "bloco": "Bloco", "titulo": "Título", "caminho": "Caminho", "conteudo": "Conteúdo",
+    "nome": "Nome",
 }
 
 TREE_COLUMNS = [
@@ -682,6 +870,71 @@ def make_card(parent, title=None, subtitle=None):
         ttk.Label(body, text=subtitle, style="CardMuted.TLabel", wraplength=820,
                   justify="left").pack(anchor="w", pady=(2, 0))
     return card, body
+
+
+class ScrollFrame(tk.Frame):
+    """
+    Área rolável (Canvas + Scrollbar + Frame interno `.inner`) com rolagem pela roda do
+    mouse. Usada na lista de empresas e na tela de manuais.
+    `on_width(largura)` é chamado quando a largura muda (para reorganizar cartões).
+    """
+
+    def __init__(self, parent, bg):
+        super().__init__(parent, bg=bg)
+        self.on_width = None
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0)
+        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vsb.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.vsb.grid(row=0, column=1, sticky="ns")
+        self.inner = tk.Frame(self.canvas, bg=bg)
+        self._window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>",
+                        lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self.canvas.bind("<Enter>", self._bind_wheel)
+        self.canvas.bind("<Leave>", self._unbind_wheel)
+        self.inner.bind("<Enter>", self._bind_wheel)
+
+    def _on_canvas_configure(self, event):
+        self.canvas.itemconfigure(self._window, width=event.width)
+        if self.on_width:
+            self.on_width(event.width)
+
+    def _bind_wheel(self, _event=None):
+        self.bind_all("<MouseWheel>", self._on_wheel)
+        self.bind_all("<Button-4>", self._on_wheel)    # Linux
+        self.bind_all("<Button-5>", self._on_wheel)
+
+    def _unbind_wheel(self, _event=None):
+        # só desliga se o ponteiro realmente saiu da área rolável
+        try:
+            x, y = self.winfo_pointerxy()
+            w = self.winfo_containing(x, y)
+        except (KeyError, tk.TclError):
+            w = None
+        while w is not None:
+            if w is self.canvas:
+                return
+            w = getattr(w, "master", None)
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.unbind_all(seq)
+
+    def _on_wheel(self, event):
+        try:
+            if self.canvas.yview() == (0.0, 1.0):
+                return   # nada para rolar
+            if event.num == 4:
+                step = -1
+            elif event.num == 5:
+                step = 1
+            else:
+                step = -1 if event.delta > 0 else 1
+            self.canvas.yview_scroll(step, "units")
+        except tk.TclError:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -861,6 +1114,8 @@ class FormDialog(tk.Toplevel):
         "choice"   lista fixa (choices)
         "password" senha com 'Mostrar' e 'Gerar'
         "secret"   senha mascarada (sem extras)
+        "text"     texto de várias linhas (Enter = nova linha)
+        "path"     caminho de arquivo com botão 'Procurar...' 
     `validate(dados) -> mensagem_de_erro | None` roda antes de fechar.
     O resultado fica em self.result (dict) ou None se cancelado.
     """
@@ -876,6 +1131,7 @@ class FormDialog(tk.Toplevel):
         self._fields = fields
         self._validate = validate
         self.vars = {}
+        self.texts = {}      # campos de várias linhas (tk.Text)
         initial = initial or {}
         suggest = suggest or {}
 
@@ -895,10 +1151,12 @@ class FormDialog(tk.Toplevel):
             if field.get("required"):
                 label += " *"
             ttk.Label(body, text=label, style="Card.TLabel").grid(
-                row=row, column=0, sticky="w", pady=7, padx=(0, 16))
+                row=row, column=0, sticky="nw" if kind == "text" else "w", pady=7,
+                padx=(0, 16))
             var = tk.StringVar(value=initial.get(key, "") or "")
             self.vars[key] = var
 
+            container = None
             if kind == "choice":
                 widget = ttk.Combobox(body, textvariable=var, values=field["choices"],
                                       state="readonly", width=36, font=FONT_BASE)
@@ -907,11 +1165,27 @@ class FormDialog(tk.Toplevel):
                                            width=38, font=FONT_BASE)
             elif kind in ("password", "secret"):
                 widget = ttk.Entry(body, textvariable=var, show="•", width=38, font=FONT_BASE)
+            elif kind == "text":
+                container = ttk.Frame(body, style="Card.TFrame")
+                widget = tk.Text(container, width=44, height=9, wrap="word", font=FONT_BASE,
+                                 relief="solid", bd=1, padx=8, pady=6, highlightthickness=0,
+                                 undo=True)
+                text_sb = ttk.Scrollbar(container, orient="vertical", command=widget.yview)
+                widget.configure(yscrollcommand=text_sb.set)
+                widget.pack(side="left", fill="both", expand=True)
+                text_sb.pack(side="left", fill="y")
+                widget.insert("1.0", initial.get(key, "") or "")
+                # Tab sai do campo (em vez de inserir tabulação)
+                widget.bind("<Tab>", lambda e: (e.widget.tk_focusNext().focus_set(), "break")[1])
+                self.texts[key] = widget
             else:
                 widget = ttk.Entry(body, textvariable=var, width=38, font=FONT_BASE)
-            widget.grid(row=row, column=1, sticky="ew", pady=7)
+            target = container if container is not None else widget
+            target.grid(row=row, column=1, sticky="ew", pady=7)
             if kind == "password":
                 self._add_password_tools(body, row, widget, var)
+            elif kind == "path":
+                self._add_browse_button(body, row, var)
             if first is None:
                 first = widget
             row += 1
@@ -958,8 +1232,19 @@ class FormDialog(tk.Toplevel):
         ttk.Button(tools, text="Gerar", style="Tool.TButton", command=generate).pack(
             side="left", padx=(8, 0))
 
+    def _add_browse_button(self, body, row, var):
+        def browse():
+            chosen = filedialog.askopenfilename(parent=self, title="Selecionar arquivo do manual")
+            if chosen:
+                var.set(os.path.normpath(chosen))
+
+        ttk.Button(body, text="Procurar...", style="Tool.TButton", command=browse).grid(
+            row=row, column=2, sticky="w", padx=(10, 0))
+
     def _on_return(self, _event):
         focused = self.focus_get()
+        if isinstance(focused, tk.Text):         # Enter em campo de texto = nova linha
+            return None
         if isinstance(focused, ttk.Button):      # Enter em um botão aciona o botão
             focused.invoke()
         else:
@@ -969,7 +1254,10 @@ class FormDialog(tk.Toplevel):
     def _save(self):
         data = {}
         for field in self._fields:
-            value = self.vars[field["key"]].get()
+            if field["key"] in self.texts:
+                value = self.texts[field["key"]].get("1.0", "end-1c")
+            else:
+                value = self.vars[field["key"]].get()
             if field.get("kind") not in ("password", "secret"):
                 value = value.strip()
             data[field["key"]] = value
@@ -1597,6 +1885,534 @@ class SettingsView(ttk.Frame):
 
 
 # --------------------------------------------------------------------------
+# Base de Conhecimento: Manuais de Apoio (blocos + cartões)
+# --------------------------------------------------------------------------
+class ManualViewer(tk.Toplevel):
+    """Janela de leitura de um manual (caminho + conteúdo) com ações rápidas."""
+
+    def __init__(self, app, manual, on_edit=None):
+        super().__init__(app)
+        self.app = app
+        self.manual = manual
+        self.on_edit = on_edit
+        self.configure(bg=COLORS["surface"])
+        self.title(manual["titulo"])
+        self.geometry("740x580")
+        self.minsize(560, 420)
+        self.transient(app)
+
+        path = (manual["caminho"] or "").strip()
+        content = (manual["conteudo"] or "").strip()
+        body = ttk.Frame(self, style="Card.TFrame", padding=24)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(4, weight=1)
+
+        ttk.Label(body, text=manual["titulo"], style="AuthTitle.TLabel", wraplength=660,
+                  justify="left").grid(row=0, column=0, sticky="w")
+        ttk.Label(body, style="CardMuted.TLabel",
+                  text=f"Bloco: {manual['bloco_nome']}   •   atualizado em {manual['atualizado_em']}"
+                  ).grid(row=1, column=0, sticky="w", pady=(2, 12))
+        if path:
+            ttk.Label(body, text="Caminho / link", style="CardMuted.TLabel").grid(
+                row=2, column=0, sticky="w")
+            self.path_var = tk.StringVar(value=path)
+            ttk.Entry(body, textvariable=self.path_var, state="readonly",
+                      font=("Consolas", 10)).grid(row=3, column=0, sticky="ew", pady=(2, 12))
+
+        box = ttk.Frame(body, style="Card.TFrame")
+        box.grid(row=4, column=0, sticky="nsew")
+        text = tk.Text(box, wrap="word", font=FONT_BASE, relief="solid", bd=1, padx=12, pady=10,
+                       bg="white", highlightthickness=0)
+        vsb = ttk.Scrollbar(box, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=vsb.set)
+        text.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="left", fill="y")
+        text.insert("1.0", content or "(Este manual não tem conteúdo em texto. "
+                                      "Use o caminho/link acima.)")
+        text.configure(state="disabled")      # só leitura (ainda dá para selecionar e copiar)
+
+        bar = ttk.Frame(body, style="Card.TFrame")
+        bar.grid(row=5, column=0, sticky="ew", pady=(16, 0))
+        if path:
+            label = "Abrir link" if manual_kind(manual) == "Link" else "Abrir arquivo"
+            ttk.Button(bar, text=label, style="Primary.TButton",
+                       command=lambda: app.open_manual_file(manual)).pack(side="left")
+            ttk.Button(bar, text="Copiar caminho", style="Copy.TButton",
+                       command=lambda: app.copy_manual_text(manual, "caminho")).pack(
+                side="left", padx=(8, 0))
+        if content:
+            ttk.Button(bar, text="Copiar conteúdo", style="Copy.TButton",
+                       command=lambda: app.copy_manual_text(manual, "conteudo")).pack(
+                side="left", padx=(8, 0))
+        ttk.Button(bar, text="Fechar", style="Tool.TButton", command=self.destroy).pack(side="right")
+        if on_edit:
+            ttk.Button(bar, text="Editar", style="Tool.TButton", command=self._edit).pack(
+                side="right", padx=(0, 8))
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.focus_set()
+
+    def _edit(self):
+        self.destroy()
+        if self.on_edit:
+            self.on_edit()
+
+
+class BlocksDialog(tk.Toplevel):
+    """Criar, renomear, reordenar e remover blocos (categorias) de manuais."""
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.db = app.db
+        self.configure(bg=COLORS["surface"])
+        self.title("Gerenciar blocos de manuais")
+        self.resizable(False, False)
+        self.transient(app)
+
+        body = ttk.Frame(self, style="Card.TFrame", padding=24)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Blocos / Categorias", style="Section.TLabel").pack(anchor="w")
+        ttk.Label(body, style="CardMuted.TLabel", wraplength=580, justify="left",
+                  text="Crie, renomeie, reordene ou remova categorias. Remover um bloco "
+                       "apaga também todos os manuais dele.").pack(anchor="w", pady=(2, 12))
+        self.tree = ttk.Treeview(body, columns=("nome", "qtd"), show="headings",
+                                 selectmode="browse", height=9)
+        self.tree.heading("nome", text="BLOCO", anchor="w")
+        self.tree.heading("qtd", text="MANUAIS", anchor="center")
+        self.tree.column("nome", width=470, anchor="w")
+        self.tree.column("qtd", width=110, anchor="center")
+        self.tree.tag_configure("odd", background=COLORS["row_alt"])
+        self.tree.tag_configure("even", background=COLORS["surface"])
+        self.tree.pack(fill="x")
+
+        bar = ttk.Frame(body, style="Card.TFrame")
+        bar.pack(fill="x", pady=(14, 0))
+        ttk.Button(bar, text="+ Novo bloco", style="Primary.TButton",
+                   command=self.new_block).pack(side="left")
+        ttk.Button(bar, text="Renomear", style="Tool.TButton",
+                   command=self.rename_block).pack(side="left", padx=8)
+        ttk.Button(bar, text="▲", width=3, style="Tool.TButton",
+                   command=lambda: self.move(-1)).pack(side="left")
+        ttk.Button(bar, text="▼", width=3, style="Tool.TButton",
+                   command=lambda: self.move(1)).pack(side="left", padx=(4, 0))
+        ttk.Button(bar, text="Remover", style="DangerSoft.TButton",
+                   command=self.remove_block).pack(side="left", padx=8)
+        ttk.Button(bar, text="Fechar", style="Tool.TButton", command=self.destroy).pack(side="right")
+
+        self.refresh()
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.update_idletasks()
+        x = app.winfo_rootx() + (app.winfo_width() - self.winfo_width()) // 2
+        y = app.winfo_rooty() + (app.winfo_height() - self.winfo_height()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self._grab()
+
+    def _grab(self):
+        try:
+            self.wait_visibility()
+            self.grab_set()
+        except tk.TclError:
+            pass
+
+    def _ask(self, *args, **kwargs):
+        """Abre um formulário por cima desta janela e devolve o modal ao terminar."""
+        result = ask_form(self, *args, **kwargs)
+        self._grab()
+        return result
+
+    def refresh(self, select_id=None):
+        self.tree.delete(*self.tree.get_children())
+        for i, b in enumerate(self.db.list_blocks_with_counts()):
+            self.tree.insert("", "end", iid=str(b["id"]), values=(b["nome"], b["manuais"]),
+                             tags=("odd" if i % 2 else "even",))
+        if select_id is not None and self.tree.exists(str(select_id)):
+            self.tree.selection_set(str(select_id))
+
+    def _selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Blocos", "Selecione um bloco na lista.", parent=self)
+            return None
+        return self.db.get_block(int(sel[0]))
+
+    def new_block(self):
+        data = self._ask("Novo bloco", [{"key": "nome", "label": "Nome do bloco",
+                                         "required": True}])
+        if data is None:
+            return
+        try:
+            new_id = self.db.add_block(data["nome"])
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Duplicado", f"Já existe um bloco chamado '{data['nome']}'.",
+                                 parent=self)
+            return
+        self.refresh(select_id=new_id)
+
+    def rename_block(self):
+        block = self._selected()
+        if block is None:
+            return
+        data = self._ask("Renomear bloco", [{"key": "nome", "label": "Novo nome",
+                                             "required": True}], initial={"nome": block["nome"]})
+        if data is None:
+            return
+        try:
+            self.db.rename_block(block["id"], data["nome"])
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Duplicado", f"Já existe um bloco chamado '{data['nome']}'.",
+                                 parent=self)
+            return
+        self.refresh(select_id=block["id"])
+
+    def move(self, delta):
+        block = self._selected()
+        if block is None:
+            return
+        self.db.move_block(block["id"], delta)
+        self.refresh(select_id=block["id"])
+
+    def remove_block(self):
+        block = self._selected()
+        if block is None:
+            return
+        total = next(b["manuais"] for b in self.db.list_blocks_with_counts()
+                     if b["id"] == block["id"])
+        name = block["nome"]
+        if total:
+            def validate(data):
+                if data["confirmacao"].casefold() != name.casefold():
+                    return "O nome digitado não confere com o do bloco."
+                return None
+
+            data = self._ask(
+                "Remover bloco", [{"key": "confirmacao", "label": f"Digite «{name}»",
+                                   "required": True}],
+                validate=validate, save_text="Remover definitivamente",
+                save_style="Danger.TButton",
+                intro=f"Você vai remover PERMANENTEMENTE o bloco «{name}» e seus {total} "
+                      "manual(is). Esta ação não pode ser desfeita.")
+            if data is None:
+                return
+        elif not messagebox.askyesno("Remover bloco", f"Remover o bloco vazio «{name}»?",
+                                     default="no", parent=self):
+            return
+        self.db.delete_block(block["id"])
+        self.refresh()
+
+
+class ManualsView(ttk.Frame):
+    """Tela 'Manuais de Apoio': blocos (categorias) com cartões de manuais."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent, style="TFrame")
+        self.app = app
+        self.db = app.db
+        self._cols = 0
+        self._groups = []         # [(frame da grade, [cartões])]
+        self._cards = {}          # id do manual -> cartão
+        self._sections = {}       # id do bloco -> seção
+        self._block_titles = {}   # id do bloco -> rótulo do título
+        self._wrap_labels = []    # [(rótulo, deslocamento)] p/ quebrar o texto pela largura
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        head = ttk.Frame(self, style="TFrame")
+        head.grid(row=0, column=0, sticky="ew", padx=28, pady=(22, 12))
+        left = ttk.Frame(head, style="TFrame")
+        left.pack(side="left")
+        ttk.Label(left, text="Manuais e Procedimentos", style="Title.TLabel").pack(anchor="w")
+        self.subtitle = ttk.Label(left, text="", style="Muted.TLabel")
+        self.subtitle.pack(anchor="w")
+        right = ttk.Frame(head, style="TFrame")
+        right.pack(side="right")
+        ttk.Button(right, text="+ Novo Manual", style="Primary.TButton",
+                   command=self.add_manual).pack(side="left")
+        ttk.Button(right, text="Gerenciar Blocos", style="Tool.TButton",
+                   command=self.manage_blocks).pack(side="left", padx=(10, 0))
+
+        self.scroll = ScrollFrame(self, COLORS["bg"])
+        self.scroll.grid(row=1, column=0, sticky="nsew", padx=(28, 18), pady=(0, 20))
+        self.scroll.on_width = self._on_width
+
+    # ---- desenho ------------------------------------------------------------------
+    def refresh(self):
+        inner = self.scroll.inner
+        for w in inner.winfo_children():
+            w.destroy()
+        self._groups, self._cards, self._sections = [], {}, {}
+        self._block_titles, self._wrap_labels = {}, []
+        blocks = self.db.list_blocks()
+        manuals = self.db.list_manuals()
+        by_block = {}
+        for m in manuals:
+            by_block.setdefault(m["bloco_id"], []).append(m)
+        self.subtitle.configure(text=f"{len(blocks)} bloco(s)  •  {len(manuals)} manual(is)")
+        if not blocks:
+            tk.Label(inner, text="Nenhum bloco criado ainda.\nClique em «Gerenciar Blocos» para "
+                                 "criar o primeiro.", bg=COLORS["bg"], fg=COLORS["muted"],
+                     font=(FONT, 12), justify="left").pack(anchor="w", pady=20)
+            return
+        for block in blocks:
+            self._build_block(inner, block, by_block.get(block["id"], []))
+        self._layout(force=True)
+
+    def _build_block(self, inner, block, manuals):
+        c = COLORS
+        section = tk.Frame(inner, bg=c["bg"])
+        section.pack(fill="x", pady=(0, 26))
+        self._sections[block["id"]] = section
+        head = tk.Frame(section, bg=c["bg"])
+        head.pack(fill="x")
+        title = tk.Label(head, text=block["nome"], bg=c["bg"], fg=c["text"],
+                         font=(FONT, 16, "bold"))
+        title.pack(side="left")
+        self._block_titles[block["id"]] = title
+        tk.Label(head, text=f"{len(manuals)} manual(is)", bg=c["bg"], fg=c["muted"],
+                 font=(FONT, 10)).pack(side="left", padx=12, pady=(5, 0))
+        ttk.Button(head, text="+ Adicionar neste bloco", style="ToolSm.TButton",
+                   command=lambda bid=block["id"]: self.add_manual(bid)).pack(side="right")
+        tk.Frame(section, bg=c["border"], height=1).pack(fill="x", pady=(8, 12))
+        grid = tk.Frame(section, bg=c["bg"])
+        grid.pack(fill="x")
+        cards = []
+        if not manuals:
+            tk.Label(grid, text="Nenhum manual neste bloco ainda.", bg=c["bg"], fg=c["muted"],
+                     font=(FONT, 11)).grid(row=0, column=0, sticky="w")
+        for m in manuals:
+            card = self._build_card(grid, m)
+            cards.append(card)
+            self._cards[m["id"]] = card
+        self._groups.append((grid, cards))
+
+    def _build_card(self, parent, m):
+        c = COLORS
+        mid = m["id"]
+        card = tk.Frame(parent, bg=c["surface"], highlightbackground=c["border"],
+                        highlightcolor=c["border"], highlightthickness=2)
+        body = ttk.Frame(card, style="Card.TFrame", padding=(16, 14))
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+
+        title = ttk.Label(body, text=m["titulo"], style="CardTitle.TLabel", justify="left",
+                          cursor="hand2")
+        title.grid(row=0, column=0, sticky="nw")
+        title.bind("<Button-1>", lambda e, mid=mid: self.view_manual(mid))
+        self._wrap_labels.append((title, 190))
+        tools = ttk.Frame(body, style="Card.TFrame")
+        tools.grid(row=0, column=1, sticky="ne", padx=(8, 0))
+        ttk.Button(tools, text="Editar", style="ToolSm.TButton",
+                   command=lambda mid=mid: self.edit_manual(mid)).pack(side="left")
+        ttk.Button(tools, text="Remover", style="DangerSoftSm.TButton",
+                   command=lambda mid=mid: self.remove_manual(mid)).pack(side="left", padx=(6, 0))
+
+        kind = manual_kind(m)
+        ttk.Label(body, text=kind.upper(), style="Chip.TLabel").grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(8, 8))
+        summary = " ".join((m["conteudo"] or "").split())
+        if len(summary) > 170:
+            summary = summary[:167] + "…"
+        row = 2
+        if summary:
+            lbl = ttk.Label(body, text=summary, style="CardMuted.TLabel", justify="left")
+            lbl.grid(row=row, column=0, columnspan=2, sticky="w")
+            self._wrap_labels.append((lbl, 36))
+            row += 1
+        if m["caminho"]:
+            ttk.Label(body, text=short_path(m["caminho"], 58), style="Path.TLabel").grid(
+                row=row, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            row += 1
+
+        actions = ttk.Frame(body, style="Card.TFrame")
+        actions.grid(row=row, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        if m["caminho"]:
+            label = "Abrir link" if kind == "Link" else "Abrir arquivo"
+            ttk.Button(actions, text=label, style="PrimarySm.TButton",
+                       command=lambda mid=mid: self.open_manual(mid)).pack(side="left")
+        if m["conteudo"]:
+            ttk.Button(actions, text="Ver conteúdo",
+                       style="ToolSm.TButton" if m["caminho"] else "PrimarySm.TButton",
+                       command=lambda mid=mid: self.view_manual(mid)).pack(side="left", padx=(6, 0))
+        copy_bar = ttk.Frame(body, style="Card.TFrame")
+        copy_bar.grid(row=row + 1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(copy_bar, text="Copiar:", style="CardMuted.TLabel").pack(side="left")
+        if m["caminho"]:
+            ttk.Button(copy_bar, text="Caminho", style="CopySm.TButton",
+                       command=lambda mid=mid: self.copy_manual(mid, "caminho")).pack(
+                side="left", padx=(6, 0))
+        if m["conteudo"]:
+            ttk.Button(copy_bar, text="Conteúdo", style="CopySm.TButton",
+                       command=lambda mid=mid: self.copy_manual(mid, "conteudo")).pack(
+                side="left", padx=(6, 0))
+        return card
+
+    def _on_width(self, width):
+        self._layout(width)
+
+    def _layout(self, width=None, force=False):
+        """Reorganiza os cartões em 1 a 3 colunas conforme a largura da janela."""
+        if width is None:
+            width = self.scroll.canvas.winfo_width()
+        cols = max(1, min(3, width // 420))
+        card_w = max(240, width // cols - 24)
+        for label, offset in self._wrap_labels:
+            label.configure(wraplength=max(120, card_w - offset))
+        if cols == self._cols and not force:
+            return
+        self._cols = cols
+        for grid, cards in self._groups:
+            for col in range(3):
+                grid.columnconfigure(col, weight=1 if col < cols else 0,
+                                     uniform="cards" if col < cols else "")
+            for i, card in enumerate(cards):
+                card.grid(row=i // cols, column=i % cols, sticky="nsew", padx=6, pady=6)
+
+    # ---- navegação (vindo da busca) ----------------------------------------------------
+    def _scroll_to(self, widget):
+        self.update_idletasks()
+        y, w = 0, widget
+        while w is not None and w is not self.scroll.inner:
+            y += w.winfo_y()
+            w = w.master
+        total = max(1, self.scroll.inner.winfo_height())
+        self.scroll.canvas.yview_moveto(max(0.0, (y - 12) / total))
+
+    def focus_manual(self, manual_id):
+        card = self._cards.get(manual_id)
+        if card is None:
+            return
+        self._scroll_to(card)
+        card.configure(highlightbackground=COLORS["primary"], highlightcolor=COLORS["primary"])
+        self.after(2600, lambda: self._unflash(card))
+
+    @staticmethod
+    def _unflash(card):
+        try:
+            card.configure(highlightbackground=COLORS["border"], highlightcolor=COLORS["border"])
+        except tk.TclError:
+            pass
+
+    def focus_block(self, block_id):
+        section, title = self._sections.get(block_id), self._block_titles.get(block_id)
+        if section is None:
+            return
+        self._scroll_to(section)
+        title.configure(fg=COLORS["primary"])
+        self.after(2600, lambda: self._unflash_title(title))
+
+    @staticmethod
+    def _unflash_title(label):
+        try:
+            label.configure(fg=COLORS["text"])
+        except tk.TclError:
+            pass
+
+    # ---- ações ---------------------------------------------------------------------------
+    def manage_blocks(self):
+        dialog = BlocksDialog(self.app)
+        self.app.wait_window(dialog)
+        self.refresh()
+
+    def _ask_manual(self, row, default_block_id=None):
+        blocks = self.db.list_blocks()
+        names = [b["nome"] for b in blocks]
+        ids = {b["nome"].casefold(): b["id"] for b in blocks}
+        if row:
+            initial = {"bloco": row["bloco_nome"], "titulo": row["titulo"],
+                       "caminho": row["caminho"], "conteudo": row["conteudo"]}
+        else:
+            default = next((b["nome"] for b in blocks if b["id"] == default_block_id), names[0])
+            initial = {"bloco": default}
+        fields = [
+            {"key": "bloco", "kind": "choice", "choices": names, "required": True},
+            {"key": "titulo", "label": "Título do manual", "required": True},
+            {"key": "caminho", "kind": "path", "label": "Caminho do arquivo ou link"},
+            {"key": "conteudo", "kind": "text", "label": "Conteúdo / passo a passo"},
+        ]
+
+        def validate(data):
+            if not data["caminho"] and not data["conteudo"]:
+                return "Informe o caminho do arquivo (ou link) e/ou escreva o conteúdo do manual."
+            return None
+
+        title = f"Editar «{row['titulo']}»" if row else "Novo manual"
+        data = ask_form(self.app, title, fields, initial=initial, validate=validate,
+                        intro="Salve o caminho de um arquivo na rede, um link e/ou escreva o "
+                              "passo a passo aqui mesmo. Não coloque senhas neste campo.")
+        if data is None:
+            return None
+        data["bloco_id"] = ids[data["bloco"].casefold()]
+        data["caminho"] = data["caminho"].strip().strip('"')
+        return data
+
+    def add_manual(self, block_id=None):
+        if not self.db.list_blocks():
+            self.app.toast("Crie um bloco antes de adicionar manuais", "warn")
+            self.manage_blocks()
+            return
+        data = self._ask_manual(None, block_id)
+        if data is None:
+            return
+        try:
+            new_id = self.db.add_manual(data["bloco_id"], data["titulo"], data["caminho"],
+                                        data["conteudo"])
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Duplicado", f"Já existe um manual '{data['titulo']}' neste bloco.",
+                                 parent=self.app)
+            return
+        self.refresh()
+        self.app.toast("✔ Manual salvo")
+        self.after(80, lambda: self.focus_manual(new_id))
+
+    def edit_manual(self, manual_id):
+        row = self.db.get_manual(manual_id)
+        if row is None:
+            self.refresh()
+            return
+        data = self._ask_manual(row)
+        if data is None:
+            return
+        try:
+            self.db.update_manual(manual_id, data["bloco_id"], data["titulo"], data["caminho"],
+                                  data["conteudo"])
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Duplicado", f"Já existe um manual '{data['titulo']}' neste bloco.",
+                                 parent=self.app)
+            return
+        self.refresh()
+        self.app.toast("✔ Manual atualizado")
+        self.after(80, lambda: self.focus_manual(manual_id))
+
+    def remove_manual(self, manual_id):
+        row = self.db.get_manual(manual_id)
+        if row is None:
+            return
+        if not messagebox.askyesno("Remover manual", f"Remover o manual «{row['titulo']}»?\n\n"
+                                   "Esta ação não pode ser desfeita.", icon="warning",
+                                   default="no", parent=self.app):
+            return
+        self.db.delete_manual(manual_id)
+        self.refresh()
+        self.app.toast("✔ Manual removido")
+
+    def view_manual(self, manual_id):
+        row = self.db.get_manual(manual_id)
+        if row is not None:
+            ManualViewer(self.app, row, on_edit=lambda: self.edit_manual(manual_id))
+
+    def open_manual(self, manual_id):
+        row = self.db.get_manual(manual_id)
+        if row is not None:
+            self.app.open_manual_file(row)
+
+    def copy_manual(self, manual_id, field):
+        row = self.db.get_manual(manual_id)
+        if row is not None:
+            self.app.copy_manual_text(row, field)
+
+
+# --------------------------------------------------------------------------
 # Aplicação
 # --------------------------------------------------------------------------
 class App(tk.Tk):
@@ -1607,12 +2423,18 @@ class App(tk.Tk):
         self.minsize(1120, 660)
         self.configure(bg=COLORS["bg"])
         self.option_add("*TCombobox*Listbox.font", FONT_BASE)
+        # Emoji fora do plano básico só em Tk >= 8.6.10; antes disso usa um símbolo simples.
+        try:
+            patch = tuple(int(x) for x in str(self.tk.call("info", "patchlevel")).split(".")[:3])
+        except (tk.TclError, ValueError):
+            patch = (8, 6, 0)
+        self.icon_books = "📚" if patch >= (8, 6, 10) else "▤"
         self._setup_styles()
 
         self.db = Database(DB_PATH)
         self.current_user = None
         self.current_company = None
-        self.in_settings = False
+        self.section = "none"        # none | company | manuals | settings
         self.company_buttons = {}
         self.search_results = []
         self.failed_attempts = 0
@@ -1658,10 +2480,10 @@ class App(tk.Tk):
                       lightcolor=[("focus", c["primary"])], darkcolor=[("focus", c["primary"])])
         style.map("TCombobox", fieldbackground=[("readonly", "white")])
 
-        def button(name, bg, fg, hover, border=None):
+        def button(name, bg, fg, hover, border=None, padding=(14, 8), size=10):
             style.configure(name, background=bg, foreground=fg, bordercolor=border or bg,
                             lightcolor=bg, darkcolor=bg, focuscolor=bg, relief="flat",
-                            padding=(14, 8), font=(FONT, 10, "bold"))
+                            padding=padding, font=(FONT, size, "bold"))
             style.map(name, background=[("disabled", c["border"]), ("pressed", hover),
                                         ("active", hover)],
                       foreground=[("disabled", c["muted"])])
@@ -1671,6 +2493,16 @@ class App(tk.Tk):
         button("Tool.TButton", c["head"], c["text"], c["border"], c["border"])
         button("Copy.TButton", "#DBEAFE", c["primary"], "#BFDBFE", "#BFDBFE")
         button("DangerSoft.TButton", c["danger_soft"], c["danger"], "#FECACA", "#FECACA")
+        small = {"padding": (10, 5), "size": 9}          # variações compactas (cartões)
+        button("PrimarySm.TButton", c["primary"], "white", c["primary_hover"], **small)
+        button("ToolSm.TButton", c["head"], c["text"], c["border"], c["border"], **small)
+        button("CopySm.TButton", "#DBEAFE", c["primary"], "#BFDBFE", "#BFDBFE", **small)
+        button("DangerSoftSm.TButton", c["danger_soft"], c["danger"], "#FECACA", "#FECACA", **small)
+        style.configure("CardTitle.TLabel", background=c["surface"], font=(FONT, 12, "bold"))
+        style.configure("Chip.TLabel", background="#DBEAFE", foreground=c["primary"],
+                        font=(FONT, 8, "bold"), padding=(8, 2))
+        style.configure("Path.TLabel", background=c["surface"], foreground=c["muted"],
+                        font=("Consolas", 9))
 
         style.configure("Treeview", font=(FONT, 11), rowheight=36, background=c["surface"],
                         fieldbackground=c["surface"], foreground=c["text"],
@@ -1770,7 +2602,8 @@ class App(tk.Tk):
             self.toast(f"✔ {label} copiada (será limpa em {CLIPBOARD_CLEAR_MS // 1000} s)")
         else:
             self._clip_text = None
-            shown = text if len(text) <= 40 else text[:37] + "…"
+            flat = " ".join(text.split())
+            shown = flat if len(flat) <= 40 else flat[:37] + "…"
             self.toast(f"✔ {label} copiado: {shown}")
 
     def _clear_clipboard_if_unchanged(self):
@@ -1788,6 +2621,26 @@ class App(tk.Tk):
         except tk.TclError:
             pass
         self._clip_text = None
+
+    # ---- manuais: abrir arquivo e copiar (usados pelos cartões e pelo visualizador) ----
+    def open_manual_file(self, manual):
+        target = (manual["caminho"] or "").strip()
+        if not target:
+            self.toast("Este manual não tem arquivo/link. Use «Ver conteúdo».", "warn")
+            return
+        error = open_path(target)
+        if error:
+            messagebox.showwarning("Não foi possível abrir", error, parent=self)
+        else:
+            self.toast(f"✔ Abrindo: {short_path(target, 45)}")
+
+    def copy_manual_text(self, manual, field):
+        text = (manual[field] or "").strip()
+        label = "Caminho" if field == "caminho" else "Conteúdo"
+        if not text:
+            self.toast(f"{label} vazio neste manual", "warn")
+            return
+        self.copy_to_clipboard(text, label)
 
     # ---- tela: primeiro acesso -------------------------------------------------
     def show_setup(self):
@@ -1874,7 +2727,7 @@ class App(tk.Tk):
         self.db.logout()                 # descarta a chave do cofre da memória
         self.current_user = None
         self.current_company = None
-        self.in_settings = False
+        self.section = "none"
         self._hide_toast()
         self.show_login()
 
@@ -1882,7 +2735,7 @@ class App(tk.Tk):
     def show_main(self):
         root = self._reset_container()
         self.current_company = None
-        self.in_settings = False
+        self.section = "none"
         root.rowconfigure(1, weight=1)
         root.columnconfigure(1, weight=1)
 
@@ -1896,13 +2749,14 @@ class App(tk.Tk):
         self.content.columnconfigure(0, weight=1)
         placeholder = ttk.Frame(self.content, style="TFrame")
         ttk.Label(placeholder, justify="center", style="Muted.TLabel", font=(FONT, 13),
-                  text="Selecione uma empresa no menu à esquerda\n"
-                       "ou pesquise por hostname, IP, AnyDesk ou e-mail (Ctrl+F).").place(
+                  text="Selecione uma empresa no menu à esquerda, abra os Manuais de Apoio\n"
+                       "ou pesquise por hostname, IP, AnyDesk, e-mail ou manual (Ctrl+F).").place(
             relx=0.5, rely=0.42, anchor="center")
         self.company_view = CompanyView(self.content, self)
         self.settings_view = SettingsView(self.content, self)
+        self.manuals_view = ManualsView(self.content, self)
         self.views = {"placeholder": placeholder, "company": self.company_view,
-                      "settings": self.settings_view}
+                      "settings": self.settings_view, "manuals": self.manuals_view}
         for view in self.views.values():
             view.grid(row=0, column=0, sticky="nsew")
 
@@ -1931,7 +2785,7 @@ class App(tk.Tk):
         self.search_entry = ttk.Entry(inner, textvariable=self.search_var, width=48,
                                       font=(FONT, 12))
         self.search_entry.pack(side="left", padx=12)
-        ttk.Label(inner, text="hostname, IP, AnyDesk, e-mail…   (Ctrl+F)",
+        ttk.Label(inner, text="hostname, IP, AnyDesk, e-mail, manuais…   (Ctrl+F)",
                   style="CardMuted.TLabel").pack(side="left")
         ttk.Label(inner, text=f"Usuário: {self.current_user}",
                   style="CardMuted.TLabel").pack(side="right")
@@ -1949,10 +2803,11 @@ class App(tk.Tk):
             pass
         return "break"
 
-    def _hover(self, widget, normal, active_fn):
+    def _hover(self, widget, normal, active_fn, hover=None):
         """Efeito de passar o mouse nos botões do menu lateral."""
+        hover = hover or COLORS["side_hover"]
         widget.bind("<Enter>", lambda e: widget.configure(
-            bg=COLORS["side_sel"] if active_fn() else COLORS["side_hover"]))
+            bg=COLORS["side_sel"] if active_fn() else hover))
         widget.bind("<Leave>", lambda e: widget.configure(
             bg=COLORS["side_sel"] if active_fn() else normal))
 
@@ -1962,7 +2817,7 @@ class App(tk.Tk):
         side.grid(row=0, column=0, rowspan=2, sticky="ns")
         side.grid_propagate(False)
         side.columnconfigure(0, weight=1)
-        side.rowconfigure(4, weight=1)
+        side.rowconfigure(5, weight=1)
 
         tk.Label(side, text="Painel de TI", bg=c["side"], fg="white", anchor="w",
                  font=(FONT, 18, "bold")).grid(row=0, column=0, columnspan=2, sticky="ew",
@@ -1977,72 +2832,37 @@ class App(tk.Tk):
         add_btn.grid(row=2, column=0, columnspan=2, sticky="ew", padx=14, pady=(18, 14))
         add_btn.bind("<Enter>", lambda e: add_btn.configure(bg=c["success_hover"]))
         add_btn.bind("<Leave>", lambda e: add_btn.configure(bg=c["success"]))
+        self.manuals_btn = tk.Button(
+            side, text=f"{self.icon_books}   Manuais de Apoio", anchor="w",
+            command=self.open_manuals, bg=c["side_hover"], fg=c["side_fg"],
+            activebackground=c["side_sel"], activeforeground="white", relief="flat", bd=0,
+            cursor="hand2", font=(FONT, 12, "bold"), padx=16, pady=12)
+        self.manuals_btn.grid(row=3, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 16))
+        self._hover(self.manuals_btn, c["side_hover"], lambda: self.section == "manuals",
+                    hover=c["side_hover2"])
         tk.Label(side, text="EMPRESAS", bg=c["side"], fg=c["side_muted"], anchor="w",
-                 font=(FONT, 9, "bold")).grid(row=3, column=0, columnspan=2, sticky="ew",
+                 font=(FONT, 9, "bold")).grid(row=4, column=0, columnspan=2, sticky="ew",
                                               padx=22, pady=(0, 4))
 
-        # Lista rolável de empresas (Canvas + Scrollbar + Frame interno)
-        self.side_canvas = tk.Canvas(side, bg=c["side"], highlightthickness=0)
-        vsb = ttk.Scrollbar(side, orient="vertical", command=self.side_canvas.yview)
-        self.side_canvas.configure(yscrollcommand=vsb.set)
-        self.side_canvas.grid(row=4, column=0, sticky="nsew")
-        vsb.grid(row=4, column=1, sticky="ns")
-        self.company_inner = tk.Frame(self.side_canvas, bg=c["side"])
-        win = self.side_canvas.create_window((0, 0), window=self.company_inner, anchor="nw")
-        self.company_inner.bind(
-            "<Configure>", lambda e: self.side_canvas.configure(scrollregion=self.side_canvas.bbox("all")))
-        self.side_canvas.bind("<Configure>", lambda e: self.side_canvas.itemconfigure(win, width=e.width))
-        self.side_canvas.bind("<Enter>", self._bind_wheel)
-        self.side_canvas.bind("<Leave>", self._unbind_wheel)
-        self.company_inner.bind("<Enter>", self._bind_wheel)
+        # Lista rolável de empresas (ScrollFrame = Canvas + Scrollbar + Frame interno)
+        self.company_scroll = ScrollFrame(side, c["side"])
+        self.company_scroll.grid(row=5, column=0, columnspan=2, sticky="nsew")
+        self.company_inner = self.company_scroll.inner
 
         # Rodapé fixo: Configurações / Sistema (ações de sessão e destrutivas ficam lá)
         tk.Frame(side, bg=c["side_hover"], height=1).grid(
-            row=5, column=0, columnspan=2, sticky="ew", padx=14, pady=(8, 0))
+            row=6, column=0, columnspan=2, sticky="ew", padx=14, pady=(8, 0))
         self.settings_btn = tk.Button(
             side, text="⚙   Configurações / Sistema", anchor="w", command=self.open_settings,
             bg=c["side"], fg=c["side_fg"], activebackground=c["side_sel"],
             activeforeground="white", relief="flat", bd=0, cursor="hand2",
             font=(FONT, 11), padx=16, pady=12)
-        self.settings_btn.grid(row=6, column=0, columnspan=2, sticky="ew", padx=10, pady=(6, 14))
-        self._hover(self.settings_btn, c["side"], lambda: self.in_settings)
-
-    # ---- rolagem do mouse na lista de empresas -------------------------------------
-    def _bind_wheel(self, _e=None):
-        self.bind_all("<MouseWheel>", self._on_wheel)
-        self.bind_all("<Button-4>", self._on_wheel)   # Linux
-        self.bind_all("<Button-5>", self._on_wheel)
-
-    def _unbind_wheel(self, _e=None):
-        # só desliga se o ponteiro realmente saiu da área da lista
-        try:
-            x, y = self.winfo_pointerxy()
-            w = self.winfo_containing(x, y)
-        except (KeyError, tk.TclError):
-            w = None
-        while w is not None:
-            if w is self.side_canvas:
-                return
-            w = getattr(w, "master", None)
-        self._unbind_wheel_force()
+        self.settings_btn.grid(row=7, column=0, columnspan=2, sticky="ew", padx=10, pady=(6, 14))
+        self._hover(self.settings_btn, c["side"], lambda: self.section == "settings")
 
     def _unbind_wheel_force(self):
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             self.unbind_all(seq)
-
-    def _on_wheel(self, event):
-        try:
-            if self.side_canvas.yview() == (0.0, 1.0):
-                return   # nada para rolar
-            if event.num == 4:
-                step = -1
-            elif event.num == 5:
-                step = 1
-            else:
-                step = -1 if event.delta > 0 else 1
-            self.side_canvas.yview_scroll(step, "units")
-        except tk.TclError:
-            pass
 
     # ---- empresas (menu lateral) ----------------------------------------------------------
     def refresh_companies(self):
@@ -2062,44 +2882,58 @@ class App(tk.Tk):
                           command=lambda cid=cid: self.select_company(cid))
             b.pack(fill="x", padx=10, pady=1)
             self._hover(b, COLORS["side"],
-                        lambda cid=cid: (not self.in_settings) and self.current_company == cid)
+                        lambda cid=cid: self.section == "company" and self.current_company == cid)
             self.company_buttons[cid] = b
         self._highlight()
 
     def _highlight(self):
         for cid, b in self.company_buttons.items():
-            selected = (not self.in_settings) and cid == self.current_company
+            selected = self.section == "company" and cid == self.current_company
             b.configure(bg=COLORS["side_sel"] if selected else COLORS["side"])
-        self.settings_btn.configure(bg=COLORS["side_sel"] if self.in_settings else COLORS["side"])
+        self.manuals_btn.configure(
+            bg=COLORS["side_sel"] if self.section == "manuals" else COLORS["side_hover"])
+        self.settings_btn.configure(
+            bg=COLORS["side_sel"] if self.section == "settings" else COLORS["side"])
 
     def select_company(self, company_id, tab=None):
         company = self.db.get_company(company_id)
         if company is None:
             return
         self.current_company = company_id
-        self.in_settings = False
+        self.section = "company"
         self._highlight()
         self.company_view.load(company, tab)
         self.show_view("company")
 
     def open_settings(self):
-        self.in_settings = True
+        self.section = "settings"
         self._highlight()
         self.settings_view.refresh()
         self.show_view("settings")
 
+    def open_manuals(self, focus_manual=None, focus_block=None):
+        """Abre a Base de Conhecimento (opcionalmente já rolando até um manual/bloco)."""
+        self.section = "manuals"
+        self._highlight()
+        self.manuals_view.refresh()
+        self.show_view("manuals")
+        if focus_manual is not None:
+            self.after(80, lambda: self.manuals_view.focus_manual(focus_manual))
+        elif focus_block is not None:
+            self.after(80, lambda: self.manuals_view.focus_block(focus_block))
+        else:
+            self.manuals_view.scroll.canvas.yview_moveto(0)
+
     def companies_changed(self, removed_id=None):
-        """Atualiza menu, tela de configurações e (se preciso) a empresa aberta."""
+        """Atualiza menu e tela de configurações (e recarrega a empresa aberta)."""
         if removed_id is not None and self.current_company == removed_id:
             self.current_company = None
         self.refresh_companies()
         self.settings_view.refresh()
-        if self.current_company is not None and not self.in_settings:
-            self.select_company(self.current_company)
-        elif self.current_company is not None:
+        if self.current_company is not None:
             company = self.db.get_company(self.current_company)
             if company is not None:
-                self.company_view.load(company)
+                self.company_view.load(company)      # mantém a aba; não troca de tela
 
     def add_company(self):
         data = ask_form(self, "Nova empresa",
@@ -2117,15 +2951,22 @@ class App(tk.Tk):
 
     # ---- pesquisa direta --------------------------------------------------------------------
     def _search(self, term, limit=30):
+        """Ativos, e-mails, manuais e blocos (nesta ordem). Cada item: (tipo, linha)."""
         results = [("asset", r) for r in self.db.search_assets(term, limit)]
         results += [("cred", r) for r in self.db.search_credentials(term, limit)]
+        results += [("manual", r) for r in self.db.search_manuals(term, limit)]
+        results += [("block", r) for r in self.db.search_blocks(term, limit)]
         return results
 
     @staticmethod
     def _result_text(kind, r):
         if kind == "asset":
             return f"[Ativo]    {r['hostname']}   |   {r['ip'] or '-'}   |   {r['empresa_nome']}"
-        return f"[E-mail]   {r['email']}   |   {r['servico'] or '-'}   |   {r['empresa_nome']}"
+        if kind == "cred":
+            return f"[E-mail]   {r['email']}   |   {r['servico'] or '-'}   |   {r['empresa_nome']}"
+        if kind == "manual":
+            return f"[Manual]   {r['titulo']}   |   Bloco: {r['bloco_nome']}"
+        return f"[Bloco]    {r['nome']}   |   Manuais de Apoio"
 
     def _on_search_key(self, event):
         if event.keysym in ("Return", "KP_Enter", "Escape", "Up", "Tab", "Left", "Right"):
@@ -2156,7 +2997,7 @@ class App(tk.Tk):
         if not results:
             self.toast("Nenhum resultado encontrado", "warn")
             return
-        # Correspondência exata de hostname/IP/e-mail vai direto; senão, o primeiro resultado.
+        # Correspondência exata (hostname/IP/e-mail/título) vai direto; senão, o primeiro.
         low = term.casefold()
         exact = []
         for kind, r in results:
@@ -2164,6 +3005,10 @@ class App(tk.Tk):
                                     or term in re.split(r"[,\s;]+", r["ip"] or "")):
                 exact.append((kind, r))
             elif kind == "cred" and r["email"].casefold() == low:
+                exact.append((kind, r))
+            elif kind == "manual" and r["titulo"].casefold() == low:
+                exact.append((kind, r))
+            elif kind == "block" and r["nome"].casefold() == low:
                 exact.append((kind, r))
         self._goto_result(*(exact or results)[0])
 
@@ -2175,6 +3020,12 @@ class App(tk.Tk):
     def _goto_result(self, kind, row):
         self._hide_search()
         self.search_var.set("")
+        if kind == "manual":
+            self.open_manuals(focus_manual=row["id"])
+            return
+        if kind == "block":
+            self.open_manuals(focus_block=row["id"])
+            return
         tab = "creds" if kind == "cred" else "assets"
         self.select_company(row["empresa_id"], tab=tab)
         panel = self.company_view.panel(tab)
